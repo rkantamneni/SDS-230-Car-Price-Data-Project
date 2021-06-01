@@ -1,0 +1,354 @@
+---
+title: 'S&DS 230: Car Price Prediction'
+author: ''
+date: "5/3/2021"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r echo = F, results = 'hide', message=FALSE}
+library(car)
+library(rvest)
+library(corrplot)
+library(dplyr)
+library(olsrr)
+myResPlots2 <- function(model, label = "Residual Plots"){
+  
+  #Normal quantile plot of studentized residuals
+  qqPlot(rstudent(model), pch=19, main=paste("NQ Plot of Studentized Residuals,",label))
+  
+  #plot of fitted vs. studentized residuals
+  plot(rstudent(model) ~ model$fitted.values, pch=19, col='red', xlab="Fitted Values", ylab = "Studentized Residuals",
+     main = paste("Fits vs. Studentized Residuals,", label), cex.main=0.9)
+  abline(h=0, lwd=3)
+  abline(h=c(3,-3), lty=2, col="green")
+  abline(h=c(2,-2), lty=2, col="blue")
+
+}
+pairsJDRS <- function (R, ...) {
+  panel.cor <- function(x, y, digits = 2, prefix = "", ...) {
+    usr <- par("usr")
+    on.exit(par(usr))
+    par(usr = c(0, 1, 0, 1))
+    r <- cor(x, y, use = "pairwise.complete.obs", method = "pearson")
+    txt <- format(c(r, 0.123456789), digits = digits)[1]
+    txt <- paste(prefix, txt, sep = "")
+    cex <- 0.8/strwidth(txt)
+    test <- cor.test(x, y)
+    Signif <- symnum(test$p.value, corr = FALSE, na = FALSE, 
+                     cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1), symbols = c("***", 
+                                                                              "**", "*", ".", " "))
+    text(0.5, 0.5, txt, cex = cex * (abs(r) + 0.3)/1.3)
+    text(0.8, 0.8, Signif, cex = cex, col = 2)
+  }
+  hist.panel = function(x, ...) {
+    par(new = TRUE)
+    hist(x, col = "light gray", probability = TRUE, axes = FALSE, 
+         main = "", breaks = "FD")
+    lines(density(x, na.rm = TRUE), col = "red", lwd = 1)
+    rug(x)
+  }
+  pairs(R, gap = 0, upper.panel = panel.smooth, lower.panel = panel.cor, 
+        diag.panel = hist.panel,  ...)
+}
+```
+
+## Introduction
+Being a car enthusiast has made me curious about what characteristics of a car exactly influence its MSRP. I have come to learn a car's price is heavily dependent on categorical variables such as brand as well as continuous variables such as its miles per gallon and horsepower. In this project, I will be determining what exactly contributes to the differences in prices between cars, and how these differences can help us build a model to predict a car's price. With this goal, I have found a [Kaggle](https://www.kaggle.com/CooperUnion/cardataset) data set which has 20+ brands' car models dating back since 2001 with each row containing characteristics and details of the car as well as the current day MSRP for that car. 
+
+## Data Cleaning
+First, I removed all the non-gas based cars because electrics, natural gas, and diesel cars are in a different realm when it comes to prices. Then, I abbreviated the drive system names (four wheel drive = FWD). Then, I cleaned the Market Category variable because there were many category tags for each car. Then, I created a variable named "YearsSince2001" that had values which are the difference between a car's manufacturing year and 2001. Some other minor data cleaning was done to remove incorrect values, and irrelevant variables were dropped. No issues were encountered during cleaning other than making decisions on what market category tags should identified as normal or luxury.
+
+```{r echo = F, results = 'hide'}
+#Import Data, Drop Popularity Columns Because I do not know the units
+setwd("/Users/revantkantamneni/Documents/Stats230/Final\ Project")
+df <- subset(read.csv("cars2.csv"), select=-c(Popularity, Model)) #https://www.kaggle.com/CooperUnion/cardataset
+```
+
+```{r results = 'hide'}
+#Remove non-gas cars and standardize gas names
+df <- subset(df, Engine.Fuel.Type %in% c('flex-fuel (premium unleaded recommended/E85)', 'flex-fuel (premium unleaded required/E85)', 'flex-fuel (unleaded/E85)', 'premium unleaded (recommended)', 'premium unleaded (required)', 'regular unleaded'))
+df$Engine.Fuel.Type <- gsub("flex-fuel.*", "Flex-Fuel", df$Engine.Fuel.Type)
+df$Engine.Fuel.Type <- gsub("premium unleaded.*", "Premium Unleaded", df$Engine.Fuel.Type)
+df$Engine.Fuel.Type <- gsub("regular unleaded.*", "Regular Unleaded", df$Engine.Fuel.Type)
+
+#Rename Drive System Names
+df$Driven_Wheels <- recode(df$Driven_Wheels, 'all wheel drive' = "AWD", 'four wheel drive' = "4WD", 'front wheel drive' = "FWD", 'rear wheel drive' = "RWD")
+
+#Remove unknown transmission types
+df <- df [!df$Transmission.Type %in% c("UNKNOWN", "DIRECT_DRIVE"),]
+
+#Multiple Tags for each car's Market.Category are assigned to Luxury or Normal
+df$Market.Category <- gsub(".*Exotic.*","Luxury", df$Market.Category)
+df$Market.Category <- gsub(".*Luxury.*","Luxury", df$Market.Category)
+df$Market.Category <- gsub(".*High-Performance.*","Luxury", df$Market.Category)
+df$Market.Category <- gsub(".*Performance.*","Luxury", df$Market.Category)
+df$Market.Category <- gsub(".*Flex Fuel.*","Normal", df$Market.Category)
+df$Market.Category <- gsub(".*Hatchback.*","Normal", df$Market.Category)
+df$Market.Category <- gsub(".*Factory Tuner.*","Normal", df$Market.Category)
+df$Market.Category <- gsub(".*Crossover.*","Normal", df$Market.Category)
+df$Market.Category <- gsub(".*Hybrid.*","Normal", df$Market.Category)
+df$Market.Category <- gsub(".*Diesel.*","Normal", df$Market.Category)
+df$Market.Category <- gsub(".*N/A.*","Normal", df$Market.Category)
+
+#Changing Years to Years Since 2001
+df <- df[df$Year>2000,]
+df$YearsSince2001 <- df$Year-2001
+df <- subset(df, select=-c(Year))
+
+#Remove Cars with 3 doors
+df <- df[df$Number.of.Doors %in% c(2,4),]
+
+#Remove Cars based on price
+df <- df[df$MSRP > 2000,] #Removing lemons
+df <- df[df$MSRP < 650000,] #Removing ultra exclusive cars, 3 cars
+
+#Remove Outlier Highway MPG
+df <- df[df$highway.MPG < 60,]
+df <- df[df$city.mpg < 60,]
+```
+
+## Variable Descriptions
+
+* Make = Brand of the Car (Categorical)
+* Engine.Fuel.Type = Fuel type required to run a car's engine (Categorical)
+* Engine.HP = Horsepower of car's engine (Continuous)
+* Engine.Cylinders = Number of Cylinders in a car's engine (Ranges from V3 to V12) (Continuous)
+* Transmission.Type = Whether a car is automatic, manual, or automated manual (Categorical)
+* Driven_Wheels = Drive system (Four Wheel Drive = FWD, Rear Wheel Drive = RWD, All Wheel Drive = AWD, Back Wheel Drive = BWD) (Categorical)
+* Number.of.Doors = Number of car doors (Categorical)
+* Market.Category = Consumer market a car is aimed towards (Luxury or Normal) (Categorical)
+* Vehicle.Size = Size of car (Compact, Midsize, Large) (Categorical)
+* Vehicle.Style = Style of car (Convertible, Sedan, SUV, etc.) (Categorical)
+* highway.MPG = Miles per gallon expected during highway use (Continuous)
+* city.mpg = Miles per gallon expected during city use (Continuous)
+* MSRP = Present day Manufacturer's Suggested Retail Price of car in USD (Continuous)
+* YearsSince2001 = Indicates how new a car is, Larger value means newer car (Oldest car in dataset is from 2001) (Continuous)
+
+## Data Transformations
+First, some data transformations must be done. As you can see there is a heavy right skew on the city mpg data in the histogram below. The following histogram and NQ plot shows the log transformation of city mpg which is now more normally distributed. Log transformations are also performed on MSRP and highway.MPG.
+
+```{r echo = F}
+#Data Transformations
+hist(df$city.mpg, col="blue", xlab="City MPG", main="Histogram of Cars' City MPG")
+
+#Create duplicate MSRP for data scraping later
+df$dupMSRP <- df$MSRP
+
+df$MSRP <- log(df$MSRP)
+df$city.mpg <- log(df$city.mpg)
+hist(df$city.mpg, col="red", xlab="Log City MPG", main="Histogram of Cars' Log City MPG")
+invisible(qqPlot(df$city.mpg, pch=19, main = "NQ Plot of Log City MPG", ylab="Log City MPG", cex=1.5))
+
+df$highway.MPG <- log(df$highway.MPG)
+```
+
+## Boxplots
+I wanted to see if there is a difference between the mean log MSRP for cars with Premium Unleaded and Regular Unleaded engine fuel types (Two of the most popular engine fuel types).  I want to also look at the difference in the mean log MSRP based on cars' transmission types. First, I will use boxplots to visualize if there is a difference in log MSRP based on the aforementioned categorical variables.
+
+```{r echo = F}
+msrpPremReg <- subset(df[, c("Engine.Fuel.Type", "Engine.HP", "MSRP", "dupMSRP", "Transmission.Type")], Engine.Fuel.Type %in% c("Premium Unleaded", "Regular Unleaded"))
+msrpPremReg <- msrpPremReg[complete.cases(msrpPremReg),]
+
+boxplot(MSRP ~ Engine.Fuel.Type, data = msrpPremReg, xlab="Engine Fuel Type", ylab=" Log MSRP", main = "Log MSRP of Cars based on their Engine Fuel Type", col=c("red","blue","green"), cex.main=0.9)
+
+boxplot(MSRP ~ Transmission.Type, data = msrpPremReg[msrpPremReg$Transmission.Type==c("AUTOMATIC","MANUAL"),], xlab="Transmission Type", ylab="Log MSRP", main = "Log MSRP of Cars based on their Transmission Type", col=c("red","blue","green"), cex.main=0.9)
+```
+
+There seems to be a relationship between log MSRP and a car's engine fuel type. From a pricing standpoint, Premium Unleaded is the most expensive while Regular Unleaded is the cheapest. It could be that cheaper cars only need cheaper fuel because the "average person" demographic is who the cheaper car is targeted to.
+There also seems to be a relationship between log MSRP and a car's transmission type. Automatic cars are known to be easier to drive, so it makes sense that there is a premium placed on that convenience.
+
+## Bootstrap
+I'll now use a two-sample t-test to test the significance of the difference of mean log MSRP between Premium and Normal engine fuel type cars, and confirm my interpretation of the prior respective boxplot. The null hypothesis is that the difference in mean log MSRP from normal and premium engine fuel types is 0, and the alternative hypothesis is that the difference is not zero.
+
+**T-Test for Log MSRP by Fuel Engine Type**
+```{r echo = F}
+t.test(msrpPremReg$MSRP[msrpPremReg$Engine.Fuel.Type == "Premium Unleaded"], msrpPremReg$MSRP
+[msrpPremReg$Engine.Fuel.Type == "Regular Unleaded"])
+```
+
+From looking at the difference in the means of log MSRP, the p-value was very small and is less than the alpha . The 95% confidence interval does not include zero. Thus, I reject the null hypothesis that the difference in mean log MSRP between premium and regular fuel engine types is 0 (There is a difference in means).
+
+I will now create a bootstrap confidence interval for the difference in mean log MSRP between Premium Unleaded and Regular Unleaded engine fuel types (Using 10000 bootstrap samples).
+
+```{r echo = F}
+test1 <- t.test(msrpPremReg$MSRP ~ msrpPremReg$Engine.Fuel.Type)
+
+N <- nrow(msrpPremReg)
+n_samp = 10000
+diffMeans <- rep(NA, n_samp)
+for(i in 1:n_samp){
+  s <- sample(1:N, N, replace = T)
+  fakeData <-  msrpPremReg[s, ]
+  diffMeans[i] <- mean(fakeData$MSRP[fakeData$Engine.Fuel.Type=="Premium Unleaded"]) - mean(fakeData$MSRP[fakeData$Engine.Fuel.Type=="Regular Unleaded"])
+}
+ci <- quantile(diffMeans, c(0.025, 0.975))
+
+#Graph Bootstrap
+hist(diffMeans, main="Bootstrapped Difference in Mean log MSRP between Premium and Regular Fuel Engine Type", xlab="Difference in Mean log MSRP", breaks = 50, col="blue", cex.main=0.6)
+abline(v = ci, lwd = 3, col = "red")
+abline(v = test1$conf.int, lwd = 3, col = "green", lty = 2)
+legend(0.68, 150, legend=c("Bootstrapped CI", "Theoretical CI"), col=c("red", "green"), lty=1:2, cex=0.8)
+```
+
+The bootstrapped confidence interval has roughly the same range as the theoretical confidence interval. We see that 0 is not included in the the 95% bootstrapped CI, which shows that there is a statistically significant difference in mean log MSRP by fuel engine type. The difference in the sample means log MSRP between Premium and Regular Fuel Engine type cars lies between 0.67 and 0.71 based on the bootstrapped interval.
+
+## Permutation
+I will now use a permutation test to see how likely it is that the difference in log MSRP based on transmission type is due to random chance. First, I will use the t-test to see if there is a difference in mean log MSRP based on transmission type, which shows that there is a difference with the p-value being lower than the threshold alpha (0.05). We can visualize this difference with the following permutaton test.
+
+**T-Test for Log MSRP by Transmission Type**
+```{r echo = F}
+(test1 <- t.test(msrpPremReg$MSRP[msrpPremReg$Transmission.Type == "AUTOMATIC"], msrpPremReg$MSRP
+[msrpPremReg$Transmission.Type == "MANUAL"]))
+```
+
+```{r echo = F}
+#Isolate
+auto <- msrpPremReg$MSRP[msrpPremReg$Transmission.Type=="AUTOMATIC"]
+manual <- msrpPremReg$MSRP[msrpPremReg$Transmission.Type=="MANUAL"]
+
+#Getting the actual mean difference
+meanDiff <- mean(auto) - mean(manual)
+N <- 10000
+diffvals <- rep(NA, N)
+for (i in 1:N) {
+  fakeDiff <- sample(msrpPremReg$Transmission.Type) #no replacement for permutation tests
+  diffvals[i] <- mean(msrpPremReg$MSRP[fakeDiff == "AUTOMATIC"]) - mean(msrpPremReg$MSRP[fakeDiff == "MANUAL"])
+}
+pval <- mean(abs(diffvals) >= abs(meanDiff)) #Two-sided p value: 
+
+hist(diffvals, xlab=" log MSRP", main ="", col="blue", xlim = c(-0.07,0.25))
+mtext("Permuted Sample Means Diff in log MSRP", cex = 1.2, line=1)
+mtext(paste0("Permuted P-Value = ", round(pval, 4),", Calculated P-Value = ", round(test1$p.value, 4)), cex=0.8, line = 0)
+abline(v = meanDiff, col="slateblue4", lwd = 3)
+text(meanDiff-0.01,900, paste("Actual Diff in Means =", round(meanDiff,2)),srt = 90, cex = 0.7)
+```
+
+This histogram shows the results of the permutation test as well as the actual observed difference in mean log MSRP by transmission type. Almost none of the random samples produced a difference in mean log MSRP as large as the observed difference. This shows that there is a low chance that the observed difference happened by chance. This makes me conclude that there is a significant difference in mean log MSRP by transmission type.
+
+## Correlation
+My intent is to create a multiple regression model, and I must see what correlations there are between log MSRP and the other continuous variables. Below are the correlation statistics between log MSRP and other variables through the matrix plot and corrplot functions.
+
+```{r echo = F}
+#Correlation
+df2 <- df[,c(13,14,3,4,11,12)]
+pairsJDRS(df2)
+
+sigcorr <- cor.mtest(df2, conf.level = .95)
+par(xpd = T)
+corrplot.mixed(cor(na.omit(df2)), lower.col = "black", upper = "ellipse", tl.col = "black", number.cex = .7, order = "hclust", tl.pos = "lt", tl.cex=.7, p.mat = sigcorr$p, sig.level = .05, mar =c(1,1,5,1))
+```
+
+There seems to be a significant correlation between all of the continuous variables (High collinearity!). Log MSRP proves to show significant, strong, positive correlation with YearsSince2001, Engine.HP, and Engine.Cylinders, because newer and more complicated/"faster" engines are more likely to be expensive. There is a moderate negative correlation with highway mpg and city mpg probably because more expensive cars probably fall into the sports category range, and are not known for fuel efficiency.
+
+## Multiple Regression
+I'm interested in what factors can significantly predict the price of cars. Horsepower? Cylinders in Engine? Manufacturing date of car? I'm going to investigate through a multiple regression for predictors of car MSRP. I will be using backwards stepwise regression to determine my final model. 
+I will be using all of the variables from my data set as predictors of price in my original model (Make, Engine.Fuel.Type, Engine.HP, Engine.Cylinders, Transmission.Type, Driven_Wheels, Number.of.Doors, Market.Category, Vehicle.Size, Vehicle.Style, highway.MPG, city.mpg, and YearsSince2001). 
+I have further subset the data to include cars at the $100,000 or lower price point because beyond that, car prices become dependent on exclusivity factors that are not measured in this data set.
+
+```{r}
+#Original model
+dfTemp <- subset(df, df$dupMSRP <= 100000)
+dfTemp <- na.omit(dfTemp[,c(15, 1:12, 14)])
+mod <- lm(dupMSRP ~ ., data = dfTemp)
+```
+```{r echo=FALSE}
+myResPlots2(mod, "MSRP")
+boxCox(mod)
+```
+
+When using the normal MSRP values, there appears to be severe heteroskedasticity and a lot more outliers than I would have expected and a skewed distribution of the residuals. From the boxCox, it would be suggested that MSRP should be log transformed, which was already done earlier and will now be used in my final model. All predictors are significant based off the ANOVA results of this model, which means I will not remove any predictors.
+
+```{r}
+#Final Model
+dfTemp <- subset(df, df$dupMSRP <= 100000)
+dfTemp <- na.omit(dfTemp[,c(13, 1:12, 14)])
+
+modBest <- lm(MSRP ~ ., data = dfTemp)
+```
+```{r echo=FALSE}
+Anova(modBest, type = 3)
+summary(modBest)
+myResPlots2(modBest, "log MSRP")
+```
+
+We can see that all of the coefficients in this model are significant after my use of backwards stepwise regression. I have an R-Squared of 0.89, due mostly to the fact I used several predictors. By looking at the Make coefficients, you can see that more affordable cars (Toyota, Honda) have negative coefficients while more luxury cars have positive coefficients (Land Rover, BMW), indicating that luxury type brands will cost more. Also, when looking at car size it looks like large cars have a smaller coefficeint than midsize cars, and this can perhaps be attributed to that large cars are meant for families and are supposed to be more affordable. Something interesting to note also is that when engine fuel type is regular, the predictor is not significant. Another interesting aspect is that city.MPG has a positive coefficient, but in the correlation plot, it had a negative correlation with log MSRP. This change is probably due to the fact that $100K+ cars were removed for creating this regression model. Horsepower and number of cylinders had positive coefficients as I had expected.
+
+By looking at the normal quantile plot, we see that the residuals are much more normally distributed than before, except for a few major outliers which was expected due to some oddly configured cars in the data set. In the fit vs. residuals plot, there are no issues of heteroskedasticity and there appears to be constant variance of the residuals across all fitted values. However, there are a few outliers, with four residuals being larger than 4, but this was expected in a dataset of ~9,000 observations. Overall, this model seems to fit well for cars made after 2001 and which are under the $100K price point.
+
+## Data Scraping
+Taking a step back from cars and their characteristics, I want to look at brands and their market share of the car market. Is there a correlation between the average car price for a brand and their market share? I will scrape the 2020 car sales numbers for each brand which will give me an estimate of each brand's market share (Example: Cars sold by BMW divided by total number of cars sold in 2020). I will then add to that data each brand's average car price which is calculated from the data set I've been working with so far. 
+
+```{r message=FALSE}
+url <- "https://www.goodcarbadcar.net/2020-us-vehicle-sales-figures-by-brand/"
+webpage <- read_html(url)
+data <- html_text(html_nodes(webpage, "td"))
+data <- data[1:442]
+brand <- data[seq(1, length(data), 13)]
+data <- suppressWarnings(as.integer(gsub(",","", data)))
+data <- na.omit(data)
+frame <- matrix(data, 12)
+carsSold <- colSums(frame)
+Total2020CarsSold <- sum(carsSold)
+
+cars <- data.frame(brand, carsSold)
+cars$marketSharePct <- round((cars$carsSold/Total2020CarsSold)*100, 2)
+cars <- cars[order(cars$marketSharePct),]
+cars2 <- cars
+
+#Make all < 1% market share brands into "Other"
+cars$brand[cars$marketSharePct < 1] <- "Other"
+sumOfOtherPct <- sum(cars$marketSharePct[cars$brand == "Other"])
+sumOfOtherSold <- sum(cars$carsSold[cars$brand == "Other"])
+other <- data.frame("Other", sumOfOtherSold, sumOfOtherPct)
+names(other) <- c("brand", "carsSold", "marketSharePct")
+cars <- cars[cars$brand!="Other",]
+cars <- rbind(cars, other)
+cars <- cars[order(cars$marketSharePct),]
+
+cars$avgPrice <- NA
+for (x in 1:length(brand)) {
+  cars$avgPrice[cars$brand==brand[x]] <- round(sum(df$dupMSRP[df$Make==brand[x]])/sum(df$Make==brand[x]),0)
+  cars2$avgPrice[cars2$brand==brand[x]] <- round(sum(df$dupMSRP[df$Make==brand[x]])/sum(df$Make==brand[x]),0)
+}
+```
+```{r echo=FALSE}
+#Add in Tesla Value and Dodge
+cars$avgPrice[cars$brand=="Ram"] <- round(sum(df$dupMSRP[df$Make=="Dodge"])/sum(df$Make=="Dodge"), 0)
+cars2$avgPrice[cars2$brand=="Ram"] <- round(sum(df$dupMSRP[df$Make=="Dodge"])/sum(df$Make=="Dodge"), 0)
+temp <- read.csv("cars2.csv")
+cars$avgPrice[cars$brand=="Tesla"] <- 79500
+cars$avgPrice[cars$brand=="Jeep"] <- 79500
+
+#Add in dollar and paste to brand label
+cars$brand2 <- paste0(cars$brand, ": $", cars$avgPrice)
+```
+```{r echo=FALSE}
+pie(cars$marketSharePct, labels = cars$brand2, radius = 1, cex = 0.57, main= "2020 USA Car Market Share by Brand", sub=" Avg. Car Cost for a brand is indicated in $")
+```
+```{r echo = F}
+#Correlation
+cars2$avgPrice[cars2$brand=="Jeep"] <- 30000
+cars2$avgPrice[cars2$brand=="Tesla"] <- 79500
+cars2$avgPrice[cars2$brand=="Jaguar"] <- 58000
+cars2$avgPrice[cars2$brand=="Mini"] <- 26000
+cars2$avgPrice[cars2$brand=="Fiat"] <- round(sum(df$dupMSRP[df$Make=="FIAT"])/sum(df$Make=="FIAT"), 0)
+cars2$avgPrice[cars2$brand=="Genesis"] <- round(sum(temp$MSRP[temp$Make=="Genesis"])/sum(temp$Make=="Genesis"), 0)
+cars2$avgPrice[cars2$brand=="Alfa Romeo"] <- round(sum(temp$MSRP[temp$Make=="Alfa Romeo"])/sum(temp$Make=="Alfa Romeo"), 0)
+
+plot(cars2$avgPrice/1000,cars2$marketSharePct,  pch=19, col="red", xlab="Avg. Price of Car in Thousands of $",
+     ylab = "US Car Market Share (%)")
+mtext(paste("Sample Correlation =", round(cor(cars2$marketSharePct,cars2$avgPrice, use = "pairwise.complete.obs"),3)), cex=0.9, line = 0)
+mtext("US Car Market Share of a Brand based on Avg. Price of Car for a Brand", cex=0.85, line = 1)
+```
+
+There is a negative correlation between a brand's average price of car and their market share. This makes sense because, in general, brands like Toyota and Ford are catering to the general public and must be affordable, where as brands like BMW cater to a nicher demographic and make up in lost marketshare by selling more expensive cars. However, I believe this correlation value would higher/stronger if I had access to more car brands' sales figures, particularly luxury brands, and, perhaps looking at the aggregate of 5 years of sales rather than a year of car sales which so happened to be during a pandemic year. I am highly skeptical of the correlation value I calculated.
+
+## Conclusions and Summary
+This project has probably confirmed some of your preconceived notions of what affects car prices. It has been discovered that there is a statistically significant difference in cars' log MSRP based on their fuel engine types and transmission type through the use of t-tests, bootstrapping, and permutation tests. We also discovered that car's miles per gallon, brand, manufacturing date, and horsepower are some of the signifcant predictors of price. While the regression model I created seems best suited for sub $100k cars, it would be interesting to see what type of model we can fit for the super high end cars and what predictor variables would be signifcant in that model. Lastly, through the use of web scraped data, I was able to see that there is a negative correlation between a car brand's market share and the average price of their car, but the specific correlation value should be viewd with skepticism.
+
